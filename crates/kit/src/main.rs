@@ -57,6 +57,8 @@ pub(crate) mod systemd;
 #[cfg(target_os = "linux")]
 mod to_disk;
 #[cfg(target_os = "linux")]
+mod toolbox;
+#[cfg(target_os = "linux")]
 mod utils;
 #[cfg(target_os = "linux")]
 mod varlink_ipc;

@@ -64,6 +64,39 @@ Inside a clone of the repo:
 cargo install --locked --path crates/kit
 ```
 
+## Toolbox and distrobox
+
+bcvk is designed to be installed on the host, alongside podman and QEMU.
+To launch a VM, it asks podman to bind-mount the bcvk binary itself and
+the host's `/usr` (which provides QEMU and virtiofsd) into a new
+container.
+
+Running bcvk from inside a [toolbox](https://containertoolbx.org/) or
+[distrobox](https://distrobox.it/) container works when podman is
+installed inside that container too. However, podman is often forwarded
+to the host instead (for example via a `flatpak-spawn --host podman`
+wrapper or the podman socket). Paths that bcvk passes to podman are then
+resolved on the host, not in the toolbox, so a bcvk binary installed only
+in the toolbox cannot be found, and podman fails with an error like
+`statfs /usr/bin/bcvk: no such file or directory`. When bcvk detects a
+toolbox or distrobox, it points here with a log message if its binary
+isn't visible on the host, and in the error when podman fails this way.
+
+The simplest fix is to install bcvk on the host (e.g. `sudo dnf install
+bcvk`, or include it in the image on image-based systems) and run it
+there. From inside a toolbox you can still invoke the host's copy with
+`flatpak-spawn --host bcvk ...`.
+
+Beware of version skew: if different bcvk binaries exist at the same
+path on the host and in the toolbox (e.g. `/usr/bin/bcvk` installed from
+packages in both), the error above doesn't happen, but the host's copy is
+the one podman mounts into the VM's container. The bcvk you ran and the
+one that sets up the VM are then different versions, which can fail in
+confusing ways. Keep them in sync, or install bcvk only on the host.
+
+See [#5](https://github.com/bootc-dev/bcvk/issues/5) for discussion of
+better support for this case.
+
 ## Platform Support
 
 - Linux: Supported

@@ -639,7 +639,8 @@ pub fn run_detached(opts: RunEphemeralOpts) -> Result<String> {
     let output = cmd.output().context("Failed to execute podman command")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(color_eyre::eyre::eyre!("Podman command failed: {}", stderr));
+        let err = eyre!("Podman command failed: {}", stderr);
+        return Err(crate::toolbox::with_podman_failure_hint(err, &stderr));
     }
 
     // Return the container ID from stdout
@@ -711,6 +712,8 @@ fn prepare_run_command_with_temp(
 
     let self_exe = std::env::current_exe()?;
     let self_exe = self_exe.as_str()?;
+    // A host-forwarded podman (e.g. from a toolbox) resolves this on the host.
+    crate::toolbox::log_self_exe_hint(Utf8Path::new(self_exe));
 
     // Process disk files and create them if needed
     let processed_disk_files = process_disk_files(&opts.mount_disk_files, &opts.image)?;
