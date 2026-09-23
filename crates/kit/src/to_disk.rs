@@ -77,7 +77,10 @@ use std::io::IsTerminal;
 
 use crate::cache_metadata::DiskImageMetadata;
 use crate::install_options::InstallOptions;
-use crate::run_ephemeral::{run_detached, CommonVmOpts, RunEphemeralOpts};
+use crate::run_ephemeral::{
+    host_mount_virtiofsd_log, run_detached, CommonVmOpts, RunEphemeralOpts,
+    HOST_STORAGE_MOUNT_NAME, ROOTFS_VIRTIOFSD_LOG,
+};
 use crate::run_ephemeral_ssh::wait_for_ssh_ready;
 use crate::{images, ssh, utils};
 use camino::Utf8PathBuf;
@@ -86,8 +89,15 @@ use color_eyre::eyre::{eyre, Context};
 use color_eyre::Result;
 use indicatif::HumanDuration;
 use indoc::indoc;
+use std::time::Duration;
 use tempfile::TempDir;
 use tracing::debug;
+
+/// How many trailing lines of each log to print when an install fails.
+const FAILURE_LOG_MAX_LINES: usize = 200;
+
+/// How long to wait for the guest to answer when fetching its kernel log.
+const FAILURE_DMESG_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Supported disk image formats
 #[derive(Debug, Clone, ValueEnum, PartialEq, Default)]
@@ -615,6 +625,11 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
         Ok(())
     })();
 
+    // The VM's logs live only in the container, so grab them before it's gone.
+    if result.is_err() {
+        print_failure_diagnostics(&container_id);
+    }
+
     // Cleanup: stop and remove the container
     debug!("Cleaning up ephemeral container...");
     let _ = std::process::Command::new("podman")
@@ -641,6 +656,94 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
         Err(e) => {
             let _ = std::fs::remove_file(&opts.target_disk);
             Err(e)
+        }
+    }
+}
+
+/// Format the last `max_lines` lines of `content` as a block headed by `title`,
+/// noting how many lines were left out.
+fn format_log_tail(title: &str, content: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let omitted = lines.len().saturating_sub(max_lines);
+    let mut out = if omitted > 0 {
+        format!(
+            "----- {title} (last {max_lines} of {} lines) -----\n",
+            lines.len()
+        )
+    } else {
+        format!("----- {title} -----\n")
+    };
+    if lines.is_empty() {
+        out.push_str("(empty)\n");
+    }
+    for line in &lines[omitted..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Read a file inside the (still running) ephemeral container.
+fn read_container_file(container_id: &str, path: &str) -> Result<String> {
+    let output = std::process::Command::new("podman")
+        .args(["exec", "--", container_id, "cat", "--", path])
+        .output()
+        .context("Failed to run podman exec")?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "podman exec cat {path} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Read the guest kernel log over SSH.
+fn read_guest_dmesg(container_id: &str) -> Result<String> {
+    let output = ssh::connect_captured(
+        container_id,
+        vec!["dmesg".to_string()],
+        Some(FAILURE_DMESG_TIMEOUT),
+    )?;
+    if output.exit_code != 0 {
+        return Err(eyre!(
+            "dmesg exited with code {}: {}",
+            output.exit_code,
+            output.stderr.trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Print the tails of the guest kernel log and of the virtiofsd logs to
+/// stderr. These are the main evidence for failures like I/O errors on the
+/// host storage share (e.g. <https://github.com/bootc-dev/bcvk/issues/157>),
+/// and are otherwise removed along with the container. Best effort: a log
+/// that can't be read is reported and skipped.
+fn print_failure_diagnostics(container_id: &str) {
+    let host_storage_log = host_mount_virtiofsd_log(HOST_STORAGE_MOUNT_NAME);
+    let logs = [
+        (
+            "guest kernel log (dmesg)".to_string(),
+            read_guest_dmesg(container_id),
+        ),
+        (
+            format!("virtiofsd log for host storage ({host_storage_log})"),
+            read_container_file(container_id, &host_storage_log),
+        ),
+        (
+            format!("virtiofsd log for root filesystem ({ROOTFS_VIRTIOFSD_LOG})"),
+            read_container_file(container_id, ROOTFS_VIRTIOFSD_LOG),
+        ),
+    ];
+    eprintln!("Installation failed; diagnostics from the install VM follow.");
+    for (title, content) in logs {
+        match content {
+            Ok(content) => eprint!(
+                "{}",
+                format_log_tail(&title, &content, FAILURE_LOG_MAX_LINES)
+            ),
+            Err(e) => eprintln!("----- {title}: unavailable: {e:#}"),
         }
     }
 }
@@ -724,6 +827,29 @@ mod tests {
         assert_eq!(size2, 5120 * 1024 * 1024);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_format_log_tail() {
+        let cases = [
+            ("", 3, "----- t -----\n(empty)\n"),
+            ("a\nb", 3, "----- t -----\na\nb\n"),
+            ("a\nb\nc\n", 3, "----- t -----\na\nb\nc\n"),
+            (
+                "a\nb\nc\nd\ne\n",
+                2,
+                "----- t (last 2 of 5 lines) -----\nd\ne\n",
+            ),
+            ("a\r\nb\r\n", 3, "----- t -----\na\nb\n"),
+            ("a\nb\n", 0, "----- t (last 0 of 2 lines) -----\n"),
+        ];
+        for (content, max_lines, expected) in cases {
+            assert_eq!(
+                format_log_tail("t", content, max_lines),
+                expected,
+                "content={content:?} max_lines={max_lines}"
+            );
+        }
     }
 
     /// Clap parses `--flag=--value` by treating everything after `=` as the raw
