@@ -251,7 +251,7 @@ fn test_varlink_images_list_contains_test_image() -> TestResult {
 
     // Ensure the image is pulled
     let sh = shell()?;
-    xshell::cmd!(sh, "podman pull -q {image}").run()?;
+    xshell::cmd!(sh, "podman pull -q --policy missing {image}").run()?;
 
     let mut bcvk = activated_connection()?;
     let reply = bcvk.rt.block_on(async { bcvk.conn.list().await })??;
@@ -573,7 +573,7 @@ fn test_varlink_images_list_crosscheck() -> TestResult {
 
     // Ensure the test image is pulled so we have at least one image to compare
     let sh = shell()?;
-    xshell::cmd!(sh, "podman pull -q {image}").run()?;
+    xshell::cmd!(sh, "podman pull -q --policy missing {image}").run()?;
 
     // Primary path: Rust varlink client
     let mut bcvk = activated_connection()?;

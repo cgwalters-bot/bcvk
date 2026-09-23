@@ -47,8 +47,9 @@ fn test_libvirt_ignition_works() -> TestResult {
     let bck = get_bck_command()?;
     let label = LIBVIRT_INTEGRATION_TEST_LABEL;
 
-    // Pull FCOS image first
-    cmd!(sh, "podman pull -q {FCOS_IMAGE}").run()?;
+    // Normally prefetched (with retries) by `just pull-test-images`; only pull
+    // if missing so a registry hiccup here can't fail the test.
+    cmd!(sh, "podman pull -q --policy missing {FCOS_IMAGE}").run()?;
 
     // Create a temporary Ignition config
     let temp_dir = TempDir::new()?;
@@ -107,8 +108,9 @@ fn test_libvirt_ignition_invalid_path() -> TestResult {
     let bck = get_bck_command()?;
     let label = LIBVIRT_INTEGRATION_TEST_LABEL;
 
-    // Pull FCOS image first
-    cmd!(sh, "podman pull -q {FCOS_IMAGE}").run()?;
+    // Normally prefetched (with retries) by `just pull-test-images`; only pull
+    // if missing so a registry hiccup here can't fail the test.
+    cmd!(sh, "podman pull -q --policy missing {FCOS_IMAGE}").run()?;
 
     let temp = TempDir::new()?;
     let nonexistent_path = Utf8Path::from_path(temp.path())
