@@ -89,6 +89,12 @@ use indoc::indoc;
 use tempfile::TempDir;
 use tracing::debug;
 
+/// Smallest output disk for `--via-image-builder`: its default bootc image size.
+const IMAGE_BUILDER_MIN_DISK_SIZE: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Size of the sparse scratch disk `--via-image-builder` works on.
+const IMAGE_BUILDER_SCRATCH_SIZE: u64 = 60 * 1024 * 1024 * 1024;
+
 /// Supported disk image formats
 #[derive(Debug, Clone, ValueEnum, PartialEq, Default)]
 pub enum Format {
@@ -361,6 +367,62 @@ EOF
         Ok(vec!["/bin/bash".to_string(), "-c".to_string(), script])
     }
 
+    /// Generate the in-VM script that builds the disk with image-builder.
+    ///
+    /// image-builder needs root, loop devices and its own osbuild store, so it
+    /// runs as a privileged container inside the ephemeral VM (booted from the
+    /// source image, so the target kernel writes the filesystems). Its own
+    /// container image runs straight from the host storage, but the source
+    /// image must be copied into the VM's primary storage: image-builder
+    /// builds its own containers-storage reference and ignores additional
+    /// image stores. The resulting raw image is written to the output disk.
+    fn generate_image_builder_command(&self, ib_image: &str) -> Result<Vec<String>> {
+        let q = |v: &str| -> Result<String> {
+            Ok(shlex::try_quote(v)
+                .map_err(|e| eyre!("Failed to quote '{v}': {e}"))?
+                .to_string())
+        };
+        let default_fs = match self.install.filesystem.as_deref() {
+            Some(fs) => format!("--bootc-default-fs {}", q(fs)?),
+            None => String::new(),
+        };
+        let script = indoc! {r#"
+            set -euo pipefail
+            # A tmpfs is too small for two container images plus osbuild's
+            # store, so everything goes on a scratch disk.
+            mkfs.xfs -f -q /dev/disk/by-id/virtio-scratch
+            mount /dev/disk/by-id/virtio-scratch /var/tmp
+            mkdir -p /var/tmp/containers /var/tmp/out /var/tmp/src
+            rm /var/lib/containers -rf
+            ln -sr /var/tmp/containers /var/lib/containers
+            AIS=/run/virtiofs-mnt-hoststorage/
+            if ! mountpoint -q ${AIS} &>/dev/null; then
+                mkdir -p ${AIS}
+                mount -t virtiofs mount_hoststorage ${AIS} -o ro
+            fi
+            echo "Copying {SOURCE_IMAGE} into the VM's container storage..."
+            STORAGE_OPTS=additionalimagestore=${AIS}                 skopeo copy -q --remove-signatures containers-storage:{SOURCE_IMAGE} oci:/var/tmp/src:image
+            skopeo copy -q oci:/var/tmp/src:image containers-storage:{SOURCE_IMAGE}
+            rm -rf /var/tmp/src
+            echo "Building the disk with {IB_IMAGE}..."
+            STORAGE_OPTS=additionalimagestore=${AIS}                 podman run --rm --privileged --net=none                 --security-opt label=type:unconfined_t                 -v /var/tmp/out:/output                 -v /var/lib/containers/storage:/var/lib/containers/storage                 {IB_IMAGE} build --bootc-ref {SOURCE_IMAGE} {DEFAULT_FS}                 --output-dir /output raw
+            raw=$(find /var/tmp/out -name '*.raw' -print -quit)
+            test -n "${raw}"
+            size=$(stat -c %s "${raw}")
+            outsize=$(blockdev --getsize64 /dev/disk/by-id/virtio-output)
+            if [ "${size}" -gt "${outsize}" ]; then
+                echo "image-builder made a ${size} byte image, larger than the ${outsize} byte output disk" >&2
+                exit 1
+            fi
+            dd if="${raw}" of=/dev/disk/by-id/virtio-output bs=4M conv=sparse,fsync status=none
+            echo "Installation completed successfully!"
+        "#}
+        .replace("{SOURCE_IMAGE}", &q(&self.source_image)?)
+        .replace("{IB_IMAGE}", &q(ib_image)?)
+        .replace("{DEFAULT_FS}", &default_fs);
+        Ok(vec!["/bin/bash".to_string(), "-c".to_string(), script])
+    }
+
     /// Calculate the optimal target disk size based on the source image or explicit size
     ///
     /// Returns explicit disk_size if provided (parsed from human-readable format),
@@ -479,7 +541,25 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
         }
     }
 
-    let disk_size = opts.calculate_disk_size()?;
+    let mut disk_size = opts.calculate_disk_size()?;
+    if let Some(ib_image) = opts.install.via_image_builder.as_deref() {
+        // image-builder sizes the image itself (10 GiB by default for bootc)
+        disk_size = disk_size.max(IMAGE_BUILDER_MIN_DISK_SIZE);
+        let exists = std::process::Command::new("podman")
+            .args(["image", "exists", "--", ib_image])
+            .status()
+            .context("Running podman image exists")?
+            .success();
+        if !exists {
+            let st = std::process::Command::new("podman")
+                .args(["pull", "--", ib_image])
+                .status()
+                .context("Running podman pull")?;
+            if !st.success() {
+                return Err(eyre!("Failed to pull {ib_image}"));
+            }
+        }
+    }
 
     // Create disk image based on format
     match opts.additional.format {
@@ -520,7 +600,10 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
 
     // Phase 3: Installation command generation
     // Generate complete script including storage setup and bootc install
-    let bootc_install_command = opts.generate_bootc_install_command(disk_size)?;
+    let bootc_install_command = match opts.install.via_image_builder.as_deref() {
+        Some(ib_image) => opts.generate_image_builder_command(ib_image)?,
+        None => opts.generate_bootc_install_command(disk_size)?,
+    };
 
     // Phase 4: Ephemeral VM configuration
     let mut common_opts = opts.additional.common.clone();
@@ -528,6 +611,30 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
     common_opts.ssh_keygen = true;
 
     let tty = std::io::stdout().is_terminal();
+
+    let mut mount_disk_files = vec![format!(
+        "{}:output:{}",
+        opts.target_disk,
+        opts.additional.format.as_str()
+    )];
+    // Sparse scratch disk for image-builder's container storage and osbuild store
+    let scratch = if opts.install.via_image_builder.is_some() {
+        let dir = opts.target_disk.parent().filter(|p| !p.as_str().is_empty());
+        let f = match dir {
+            Some(d) => tempfile::NamedTempFile::new_in(d),
+            None => tempfile::NamedTempFile::new_in("."),
+        }
+        .context("Creating image-builder scratch disk")?;
+        f.as_file().set_len(IMAGE_BUILDER_SCRATCH_SIZE)?;
+        let path = f
+            .path()
+            .to_str()
+            .ok_or_else(|| eyre!("Non-UTF-8 scratch path"))?;
+        mount_disk_files.push(format!("{path}:scratch:raw"));
+        Some(f)
+    } else {
+        None
+    };
 
     // Boot the install VM to a minimal target instead of default.target.
     // This is to prevent user-created services in the image (such as quadlets)
@@ -568,11 +675,7 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
         ro_bind_mounts: Vec::new(), // No additional ro bind mounts needed
         systemd_units_dir: Some(units_dir.path().to_string_lossy().to_string()),
         bind_storage_ro: true, // Mount host container storage read-only
-        mount_disk_files: vec![format!(
-            "{}:output:{}",
-            opts.target_disk,
-            opts.additional.format.as_str()
-        )], // Attach target disk
+        mount_disk_files,      // Attach target (and scratch) disk
         kernel_args: vec!["systemd.unit=bcvk-to-disk.target".to_string()],
         ignition_config: None,
         debug_entrypoint: None,
@@ -615,6 +718,7 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
         Ok(())
     })();
 
+    drop(scratch);
     // Cleanup: stop and remove the container
     debug!("Cleaning up ephemeral container...");
     let _ = std::process::Command::new("podman")

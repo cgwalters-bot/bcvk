@@ -10,6 +10,10 @@
 use camino::Utf8PathBuf;
 use clap::Parser;
 
+/// The image-builder container image used by `--via-image-builder` when no
+/// image is given.
+pub const DEFAULT_IMAGE_BUILDER_IMAGE: &str = "ghcr.io/osbuild/image-builder-cli:latest";
+
 /// Common installation options for bootc disk operations
 ///
 /// These options control filesystem configuration and storage paths
@@ -52,6 +56,19 @@ pub struct InstallOptions {
     /// backend
     #[clap(long, requires = "composefs_backend")]
     pub allow_missing_fsverity: bool,
+
+    /// Build the disk with image-builder (osbuild) instead of `bootc install
+    /// to-disk`, so it gets image-builder's default layout (e.g. a separate
+    /// /boot partition). Optionally names the image-builder container image,
+    /// which must be in (or is pulled into) the host container storage.
+    #[clap(
+        long,
+        value_name = "IMAGE",
+        num_args = 0..=1,
+        default_missing_value = DEFAULT_IMAGE_BUILDER_IMAGE,
+        conflicts_with_all = ["root_size", "target_transport", "karg", "composefs_backend"]
+    )]
+    pub via_image_builder: Option<String>,
 }
 
 impl InstallOptions {

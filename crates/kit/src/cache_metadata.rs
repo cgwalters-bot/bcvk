@@ -56,6 +56,10 @@ struct CacheInputs {
     /// Kernel arguments used during installation
     kernel_args: Vec<String>,
 
+    /// image-builder container image, when the disk was built with it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_builder: Option<String>,
+
     /// Version of the cache format for future compatibility
     version: u32,
 }
@@ -88,6 +92,9 @@ pub struct DiskImageMetadata {
     /// Kernel arguments used during installation
     pub kernel_args: Vec<String>,
 
+    /// image-builder container image, when the disk was built with it
+    pub image_builder: Option<String>,
+
     /// Version of the metadata format for future compatibility
     pub version: u32,
 }
@@ -104,6 +111,7 @@ impl DiskImageMetadata {
             composefs_backend: self.composefs_backend,
             bootloader: self.bootloader.clone(),
             kernel_args: self.kernel_args.clone(),
+            image_builder: self.image_builder.clone(),
             version: self.version,
         };
 
@@ -200,6 +208,7 @@ impl DiskImageMetadata {
             kernel_args: options.karg.clone(),
             composefs_backend: options.composefs_backend,
             bootloader: options.bootloader.clone(),
+            image_builder: options.via_image_builder.clone(),
         }
     }
 }
@@ -359,6 +368,7 @@ mod tests {
             kernel_args: vec!["console=ttyS0".to_string()],
             composefs_backend: false,
             bootloader: Some("grub".to_string()),
+            image_builder: None,
             version: 1,
         };
 
